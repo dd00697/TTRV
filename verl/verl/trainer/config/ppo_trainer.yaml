@@ -38,6 +38,9 @@ actor_rollout_ref:
     use_dynamic_bsz: False
     ppo_max_token_len_per_gpu: 16384 # n * ${data.max_prompt_length} + ${data.max_response_length}
     grad_clip: 1.0
+    grad_clip_foreach: False
+    skip_grad_clip: False
+    grad_diagnostics: False
     # pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
     clip_ratio: 0.2 # default value if clip_ratio_low and clip_ratio_high are not specified
     clip_ratio_low: 0.2
@@ -68,6 +71,8 @@ actor_rollout_ref:
         min_num_params: 0
       param_offload: False
       optimizer_offload: False
+      defer_optimizer_load: False
+      model_dtype: null
       fsdp_size: -1
   ref:
     strategy: fsdp
@@ -191,6 +196,10 @@ custom_reward_function:
   path: null
   name: compute_score
 
+rollout_logging:
+  enabled: False
+  dir: /workspace/runs/ttrv/rollout_logs
+
 algorithm:
   gamma: 1.0
   lam: 1.0
@@ -218,6 +227,7 @@ trainer:
   resume_mode: auto # or disable or resume_path if resume_from_path is set
   resume_from_path: null
   val_before_train: True
+  val_only: False
   test_freq: -1
   critic_warmup: 0
   default_hdfs_dir: null
