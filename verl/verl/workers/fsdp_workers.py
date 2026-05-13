@@ -528,9 +528,10 @@ class ActorRolloutRefWorker(Worker):
         data = data.to(torch.cuda.current_device())
 
         assert self._is_actor
+        defer_optimizer_load = self.config.actor.fsdp_config.get("defer_optimizer_load", False)
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
+        if self._is_offload_optimizer and not defer_optimizer_load:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
 
         log_gpu_memory_usage("Before update policy", logger=logger)
