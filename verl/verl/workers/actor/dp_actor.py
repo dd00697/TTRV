@@ -30,9 +30,14 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs
+from verl.utils.fsdp_utils import load_fsdp_optimizer, offload_fsdp_optimizer
 from verl.workers.actor import BasePPOActor
 
 __all__ = ["DataParallelPPOActor"]
+
+
+def _format_grad_name(name: str | None) -> str:
+    return name if name else "<unnamed_parameter>"
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -71,11 +76,13 @@ class DataParallelPPOActor(BasePPOActor):
                 for key in micro_batch["multi_modal_inputs"][0].keys():
                     multi_modal_inputs[key] = torch.cat(
                         [inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0
-                    )
+                    ).to(torch.cuda.current_device())
                     if re.match("internvl", self.actor_module.config.model_type):
                         # The image_flags is used for InternVL's github version
                         if key == "pixel_values":
-                            image_flags = torch.ones(multi_modal_inputs[key].size(0), dtype=torch.long)
+                            image_flags = torch.ones(
+                                multi_modal_inputs[key].size(0), dtype=torch.long, device=torch.cuda.current_device()
+                            )
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
@@ -195,20 +202,81 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
 
+    def _grad_diagnostics(self):
+        total_params = 0
+        grad_params = 0
+        nonfinite = []
+        first_grad = None
+        for name, param in self.actor_module.named_parameters():
+            total_params += 1
+            grad = param.grad
+            if grad is None:
+                continue
+            grad_params += 1
+            if first_grad is None:
+                first_grad = (name, tuple(grad.shape), str(grad.dtype), str(grad.device))
+            try:
+                if not torch.isfinite(grad).all().item():
+                    nonfinite.append((name, tuple(grad.shape), str(grad.dtype), str(grad.device)))
+            except RuntimeError as exc:
+                print(f"ERROR: gradient diagnostics failed reading {_format_grad_name(name)}: {exc}")
+                raise
+
+        print(
+            "actor grad diagnostics: "
+            f"total_params={total_params}, grad_params={grad_params}, "
+            f"first_grad={first_grad}, nonfinite_count={len(nonfinite)}"
+        )
+        for name, shape, dtype, device in nonfinite[:10]:
+            print(f"actor grad diagnostics nonfinite: {name} shape={shape} dtype={dtype} device={device}")
+
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
+        fsdp_config = self.config.get("fsdp_config", {})
+        defer_optimizer_load = fsdp_config.get("optimizer_offload", False) and fsdp_config.get(
+            "defer_optimizer_load", False
+        )
 
+        def optimizer_step():
+            if defer_optimizer_load:
+                load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+            self.actor_optimizer.step()
+            if defer_optimizer_load:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                torch.cuda.empty_cache()
+
+        if self.config.get("grad_diagnostics", False):
+            self._grad_diagnostics()
+
+        if self.config.get("skip_grad_clip", False):
+            grad_norm = torch.tensor(float("nan"), device=torch.cuda.current_device())
+            optimizer_step()
+            return grad_norm
+
+        foreach = self.config.get("grad_clip_foreach", False)
         if isinstance(self.actor_module, FSDP):
-            grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            if world_size == 1:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.actor_module.parameters(),
+                    max_norm=self.config.grad_clip,
+                    foreach=foreach,
+                )
+            else:
+                grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor_module.parameters(),
+                max_norm=self.config.grad_clip,
+                foreach=foreach,
+            )
 
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
             print(f"WARN: grad_norm is not finite: {grad_norm}")
-            self.actor_optimizer.zero_grad()
+            self.actor_optimizer.zero_grad(set_to_none=True)
         else:
-            self.actor_optimizer.step()
+            optimizer_step()
         return grad_norm
 
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
@@ -234,6 +302,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
+        if temperature <= 0:
+            raise ValueError("actor_rollout_ref.rollout.temperature must be > 0 for log-prob computation")
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
@@ -283,18 +353,20 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
+        if temperature <= 0:
+            raise ValueError("actor_rollout_ref.rollout.temperature must be > 0 for actor log-prob training")
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        non_tensor_select_keys = ["multi_modal_inputs"]
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         if has_multi_modal_inputs:
             num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
-            non_tensor_select_keys = ["multi_modal_inputs"]
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
@@ -320,7 +392,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # split batch into micro_batches
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
-                self.actor_optimizer.zero_grad()
+                self.actor_optimizer.zero_grad(set_to_none=True)
 
                 for data in micro_batches:
                     # Support all hardwares
@@ -405,6 +477,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
+                self.actor_optimizer.zero_grad(set_to_none=True)
             append_to_dict(metrics, data)
-        self.actor_optimizer.zero_grad()
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
         return metrics
