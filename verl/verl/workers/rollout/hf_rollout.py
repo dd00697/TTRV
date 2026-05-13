@@ -34,13 +34,30 @@ from .base import BaseRollout
 __all__ = ["HFRollout"]
 
 
+_GENERATE_INPUT_KEYS = {"input_ids", "attention_mask", "position_ids"}
+
+
+def _to_device(value, device):
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: _to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_device(item, device) for item in value)
+    return value
+
+
 class HFRollout(BaseRollout):
     def __init__(self, module: nn.Module, config):
         super().__init__()
         self.config = config
         self.module = module
 
-    def generate_sequences(self, prompts: DataProto) -> DataProto:
+    def generate_sequences(self, prompts: DataProto, n: int = 1) -> DataProto:
+        if n != 1:
+            raise NotImplementedError("HFRollout only supports n=1 for now")
         batch_size = prompts.batch.batch_size[0]
         num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
         batch_prompts = prompts.chunk(chunks=num_chunks)
@@ -48,11 +65,40 @@ class HFRollout(BaseRollout):
         output = DataProto.concat(output)
         return output
 
+    def _multi_modal_kwargs(self, prompts: DataProto, device) -> dict:
+        if "multi_modal_inputs" not in prompts.non_tensor_batch:
+            return {}
+
+        multi_modal_inputs = prompts.non_tensor_batch["multi_modal_inputs"]
+        if len(multi_modal_inputs) == 0:
+            return {}
+
+        rows = list(multi_modal_inputs)
+        kwargs = {}
+        for key in rows[0].keys():
+            if key in _GENERATE_INPUT_KEYS:
+                continue
+
+            values = []
+            for row in rows:
+                if key not in row:
+                    raise KeyError(f"Missing multi_modal_inputs[{key!r}] in one rollout row")
+                values.append(row[key])
+
+            first = values[0]
+            if torch.is_tensor(first):
+                kwargs[key] = torch.cat([value.to(device) for value in values], dim=0)
+            else:
+                kwargs[key] = _to_device(values, device)
+
+        return kwargs
+
     @torch.no_grad()
     def _generate_minibatch(self, prompts: DataProto) -> DataProto:
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         attention_mask = prompts.batch["attention_mask"]  # left-padded attention_mask
         position_ids = prompts.batch["position_ids"]
+        multi_modal_kwargs = self._multi_modal_kwargs(prompts, idx.device)
 
         # used to construct attention_mask
         eos_token_id = prompts.meta_info["eos_token_id"]
@@ -83,20 +129,22 @@ class HFRollout(BaseRollout):
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
         with param_ctx:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                output = self.module.generate(
-                    input_ids=idx,
-                    attention_mask=attention_mask,
-                    do_sample=do_sample,
-                    max_new_tokens=response_length,
+                generate_kwargs = {
+                    "input_ids": idx,
+                    "attention_mask": attention_mask,
+                    "do_sample": do_sample,
+                    "max_new_tokens": response_length,
                     # max_length=max_length,
-                    eos_token_id=eos_token_id,
-                    pad_token_id=pad_token_id,
-                    generation_config=generation_config,
+                    "eos_token_id": eos_token_id,
+                    "pad_token_id": pad_token_id,
+                    "generation_config": generation_config,
                     # renormalize_logits=True,
-                    output_scores=False,  # this is potentially very large
-                    return_dict_in_generate=True,
-                    use_cache=True,
-                )
+                    "output_scores": False,  # this is potentially very large
+                    "return_dict_in_generate": True,
+                    "use_cache": True,
+                    **multi_modal_kwargs,
+                }
+                output = self.module.generate(**generate_kwargs)
         # TODO: filter out the seq with no answers like ds-chat
         seq = output.sequences
 
@@ -117,9 +165,11 @@ class HFRollout(BaseRollout):
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, position_ids.size(1), -1)
 
-        response_position_ids = position_ids[:, -1:] + delta_position_id
+        response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
 
         response_attention_mask = get_response_mask(
