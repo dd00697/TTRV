@@ -170,24 +170,54 @@ class FSDPVLLMShardingManager(BaseShardingManager):
     def update_params(self, updated_params):
         model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
         world_size = torch.distributed.get_world_size()
+        param_items = (
+            (name, param.full_tensor() if world_size != 1 and hasattr(param, "full_tensor") else param)
+            for name, param in updated_params.items()
+        )
         if model.config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
             loaded_params = patched_ds_v3_load_weights(
                 model,
-                (
-                    (name, param.full_tensor() if world_size != 1 and hasattr(param, "full_tensor") else param)
-                    for name, param in updated_params.items()
-                ),
+                param_items,
             )
         elif model.config.architectures[0] in ["Qwen2MoeForCausalLM"]:
             loaded_params = patched_qwen_moe_load_weights(
                 model,
-                (
-                    (name, param.full_tensor() if world_size != 1 and hasattr(param, "full_tensor") else param)
-                    for name, param in updated_params.items()
-                ),
+                param_items,
             )
+        elif model.config.architectures[0] in ["Qwen2_5_VLForConditionalGeneration"]:
+            loaded_params = model.load_weights(self._iter_qwen25vl_weights(param_items))
         else:
-            loaded_params = model.load_weights(
-                ((name, param.full_tensor() if world_size != 1 else param) for name, param in updated_params.items())
-            )
+            loaded_params = model.load_weights(param_items)
         logger.info(f"vLLM load weights, loaded_params: {len(loaded_params)}")
+
+    @staticmethod
+    def _iter_qwen25vl_weights(params):
+        """Normalize HF wrapper prefixes before vLLM Qwen2.5-VL loading.
+
+        The TTRV FSDP actor can expose the HF Qwen2.5-VL root module under an
+        extra ``model.`` prefix. vLLM's Qwen2.5-VL loader already maps HF
+        language-model keys like ``model.layers.*`` into
+        ``language_model.model.layers.*``. If we pass ``model.visual.*``
+        through unchanged, that generic language prefix catches the vision
+        tower and vLLM tries to load ``visual.*`` into Qwen2 instead.
+        """
+        for name, param in params:
+            if name.startswith("model.visual."):
+                name = name[len("model.") :]
+            elif name.startswith("model.model."):
+                name = name[len("model.") :]
+            elif name.startswith("model.lm_head."):
+                name = name[len("model.") :]
+            elif name.startswith("model.language_model.model."):
+                name = "model." + name[len("model.language_model.model.") :]
+            elif name.startswith("model.language_model.lm_head."):
+                name = "lm_head." + name[len("model.language_model.lm_head.") :]
+            elif name.startswith("model.language_model."):
+                name = "model." + name[len("model.language_model.") :]
+            elif name.startswith("language_model.model."):
+                name = "model." + name[len("language_model.model.") :]
+            elif name.startswith("language_model.lm_head."):
+                name = "lm_head." + name[len("language_model.lm_head.") :]
+            elif name.startswith("language_model."):
+                name = "model." + name[len("language_model.") :]
+            yield name, param

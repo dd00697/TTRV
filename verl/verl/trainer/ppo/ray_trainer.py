@@ -491,10 +491,12 @@ class RayPPOTrainer:
         else:
             sampler = SequentialSampler(data_source=self.train_dataset)
 
+        dataloader_num_workers = int(self.config.data.get("dataloader_num_workers", 8))
+
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
             batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-            num_workers=8,
+            num_workers=dataloader_num_workers,
             drop_last=True,
             collate_fn=collate_fn,
             sampler=sampler,
@@ -512,7 +514,7 @@ class RayPPOTrainer:
             # Validation datasets are sent to inference engines as a whole batch,
             # which will schedule the memory themselves.
             batch_size=20, # double check this ==> reduce it to 400
-            num_workers=8,
+            num_workers=dataloader_num_workers,
             shuffle=False,
             drop_last=False,
             collate_fn=collate_fn,
@@ -625,6 +627,119 @@ class RayPPOTrainer:
                     "ttrl": self._json_safe(ttrl_metrics),
                 }
                 handle.write(json.dumps(record, allow_nan=False, sort_keys=True) + "\n")
+
+    def _batch_summary(self, batch: DataProto) -> dict:
+        tensor_shapes = {}
+        if batch.batch is not None:
+            for key, value in batch.batch.items():
+                tensor_shapes[key] = {
+                    "shape": list(value.shape),
+                    "dtype": str(value.dtype),
+                    "device": str(value.device),
+                }
+        non_tensor_shapes = {
+            key: list(value.shape) if hasattr(value, "shape") else None
+            for key, value in batch.non_tensor_batch.items()
+        }
+        return {
+            "batch_len": len(batch),
+            "tensor_shapes": tensor_shapes,
+            "non_tensor_shapes": non_tensor_shapes,
+            "meta_info": self._json_safe(batch.meta_info),
+        }
+
+    def _dump_update_batch(self, batch: DataProto, metrics: dict, timing_raw: dict):
+        dump_path = self.config.trainer.get("dump_update_batch_path", None)
+        if not dump_path:
+            return
+
+        dump_path = os.path.abspath(os.path.expanduser(str(dump_path)))
+        os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+        batch.to("cpu").save_to_disk(dump_path)
+
+        metadata = {
+            "path": dump_path,
+            "experiment_name": self.config.trainer.experiment_name,
+            "global_step": int(self.global_steps),
+            "stage": "post_advantage_pre_update_actor",
+            "metrics": self._json_safe(metrics),
+            "timing_raw": self._json_safe(timing_raw),
+            "batch": self._batch_summary(batch),
+            "config": self._json_safe(OmegaConf.to_container(self.config, resolve=True)),
+        }
+        meta_path = f"{dump_path}.meta.json"
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2, sort_keys=True)
+        print(f"Dumped update-only replay batch to {dump_path}")
+
+    def _drop_recomputed_logprob_fields(self, batch: DataProto):
+        for key in ["old_log_probs", "entropys"]:
+            if key in batch.batch.keys():
+                batch.batch.pop(key)
+
+    def _run_update_only_replay(self, logger):
+        replay_path = self.config.trainer.get("update_only_replay_path", None)
+        if not replay_path:
+            return False
+
+        replay_path = os.path.abspath(os.path.expanduser(str(replay_path)))
+        batch = DataProto.load_from_disk(replay_path)
+        self._drop_recomputed_logprob_fields(batch)
+        batch.meta_info.setdefault("temperature", self.config.actor_rollout_ref.rollout.temperature)
+        if "global_token_num" not in batch.meta_info and "attention_mask" in batch.batch.keys():
+            batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+        metrics = {"update_only/replay": 1.0}
+        timing_raw = {}
+
+        with _timer("step", timing_raw):
+            with _timer("old_log_prob", timing_raw):
+                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                entropys = old_log_prob.batch["entropys"]
+                response_masks = batch.batch["response_mask"]
+                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                entropy_loss = agg_loss(
+                    loss_mat=entropys,
+                    loss_mask=response_masks,
+                    loss_agg_mode=loss_agg_mode,
+                )
+                metrics.update(
+                    {
+                        "actor/entropy_loss": entropy_loss.detach().item(),
+                        "train/entropy": entropy_loss.detach().item(),
+                    }
+                )
+                batch = batch.union(old_log_prob)
+
+            with _timer("update_actor", timing_raw):
+                actor_output = self.actor_rollout_wg.update_actor(batch)
+            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+            metrics.update(actor_output_metrics)
+
+        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+        metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+        n_gpus = self.resource_pool_manager.get_n_gpus()
+        metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+        self._write_rollout_log(batch=batch, metrics=metrics, timing_raw=timing_raw, phase="update_only_replay")
+
+        output_path = self.config.trainer.get("update_only_replay_metrics_path", None)
+        if output_path is None:
+            output_dir = self.config.trainer.get("default_local_dir", ".")
+            output_path = os.path.join(os.path.dirname(str(output_dir)), "update_only_replay_metrics.json")
+        output_path = os.path.abspath(os.path.expanduser(str(output_path)))
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        payload = {
+            "source_batch": replay_path,
+            "metrics": self._json_safe(metrics),
+            "timing_raw": self._json_safe(timing_raw),
+            "batch": self._batch_summary(batch),
+            "config": self._json_safe(OmegaConf.to_container(self.config, resolve=True)),
+        }
+        with open(output_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+        print(f"Update-only replay metrics written to {output_path}")
+        logger.log(data=metrics, step=self.global_steps)
+        return True
 
     def _write_validation_log(
         self,
@@ -748,23 +863,39 @@ class RayPPOTrainer:
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
+            preserved_non_tensors = {
+                key: test_batch.non_tensor_batch[key]
+                for key in ["extra_info"]
+                if key in test_batch.non_tensor_batch
+            }
 
             if "multi_modal_inputs" in test_batch.non_tensor_batch.keys():
                 test_gen_batch = test_batch.pop(
                     batch_keys=["input_ids", "attention_mask", "position_ids"],
-                    non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data", "multi_modal_inputs"],
+                    non_tensor_batch_keys=[
+                        key
+                        for key in ["raw_prompt_ids", "multi_modal_data", "multi_modal_inputs", "extra_info"]
+                        if key in test_batch.non_tensor_batch
+                    ],
                 )
             else:
                 test_gen_batch = test_batch.pop(
                     batch_keys=["input_ids", "attention_mask", "position_ids"],
-                    non_tensor_batch_keys=["raw_prompt_ids"],
+                    non_tensor_batch_keys=[
+                        key for key in ["raw_prompt_ids", "extra_info"] if key in test_batch.non_tensor_batch
+                    ],
                 )
+            test_batch.non_tensor_batch.update(preserved_non_tensors)
 
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "recompute_log_prob": False,
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "temperature": self.config.actor_rollout_ref.rollout.val_kwargs.temperature,
+                "top_p": self.config.actor_rollout_ref.rollout.val_kwargs.top_p,
+                "top_k": self.config.actor_rollout_ref.rollout.val_kwargs.top_k,
+                "response_length": self.config.data.max_response_length,
                 "validate": True,
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
@@ -860,23 +991,39 @@ class RayPPOTrainer:
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
+            preserved_non_tensors = {
+                key: test_batch.non_tensor_batch[key]
+                for key in ["extra_info"]
+                if key in test_batch.non_tensor_batch
+            }
 
             if "multi_modal_inputs" in test_batch.non_tensor_batch.keys():
                 test_gen_batch = test_batch.pop(
                     batch_keys=["input_ids", "attention_mask", "position_ids"],
-                    non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data", "multi_modal_inputs"],
+                    non_tensor_batch_keys=[
+                        key
+                        for key in ["raw_prompt_ids", "multi_modal_data", "multi_modal_inputs", "extra_info"]
+                        if key in test_batch.non_tensor_batch
+                    ],
                 )
             else:
                 test_gen_batch = test_batch.pop(
                     batch_keys=["input_ids", "attention_mask", "position_ids"],
-                    non_tensor_batch_keys=["raw_prompt_ids"],
+                    non_tensor_batch_keys=[
+                        key for key in ["raw_prompt_ids", "extra_info"] if key in test_batch.non_tensor_batch
+                    ],
                 )
+            test_batch.non_tensor_batch.update(preserved_non_tensors)
 
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "recompute_log_prob": False,
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "temperature": self.config.actor_rollout_ref.rollout.val_kwargs.temperature,
+                "top_p": self.config.actor_rollout_ref.rollout.val_kwargs.top_p,
+                "top_k": self.config.actor_rollout_ref.rollout.val_kwargs.top_k,
+                "response_length": self.config.data.max_response_length,
                 "validate": True,
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
@@ -1200,6 +1347,11 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        if self.config.trainer.get("update_only_replay_path", None):
+            self.global_steps = int(self.config.trainer.get("update_only_replay_step", 1))
+            self._run_update_only_replay(logger)
+            return
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
@@ -1231,19 +1383,25 @@ class RayPPOTrainer:
                 # pop those keys for generation
                 preserved_non_tensors = {
                     key: batch.non_tensor_batch[key]
-                    for key in ["multi_modal_data", "multi_modal_inputs"]
+                    for key in ["multi_modal_data", "multi_modal_inputs", "extra_info"]
                     if key in batch.non_tensor_batch
                 }
                 if "multi_modal_inputs" in batch.non_tensor_batch.keys():
                     gen_batch = batch.pop(
                         batch_keys=["input_ids", "attention_mask", "position_ids"],
-                        non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data", "multi_modal_inputs"],
+                        non_tensor_batch_keys=[
+                            key
+                            for key in ["raw_prompt_ids", "multi_modal_data", "multi_modal_inputs", "extra_info"]
+                            if key in batch.non_tensor_batch
+                        ],
                         meta_info_keys=["do_vote"]
                     )
                 else:
                     gen_batch = batch.pop(
                         batch_keys=["input_ids", "attention_mask", "position_ids"],
-                        non_tensor_batch_keys=["raw_prompt_ids"],
+                        non_tensor_batch_keys=[
+                            key for key in ["raw_prompt_ids", "extra_info"] if key in batch.non_tensor_batch
+                        ],
                         meta_info_keys=["do_vote"]
                     )
                 batch.non_tensor_batch.update(preserved_non_tensors)
@@ -1387,6 +1545,7 @@ class RayPPOTrainer:
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                         )
+                        self._dump_update_batch(batch=batch, metrics=metrics, timing_raw=timing_raw)
 
                     # update critic
                     if self.use_critic:
