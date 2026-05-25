@@ -16,6 +16,7 @@ Single Process Actor
 """
 import re
 import itertools
+import contextlib
 from typing import Tuple
 
 import torch
@@ -30,9 +31,80 @@ from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs
+from verl.utils.fsdp_utils import load_fsdp_optimizer, offload_fsdp_optimizer
 from verl.workers.actor import BasePPOActor
 
 __all__ = ["DataParallelPPOActor"]
+
+
+def _visual_pruning_context(module, *, stage: str | None, extra_info=None):
+    if stage is None:
+        return contextlib.nullcontext()
+    stack = contextlib.ExitStack()
+    try:
+        from src.ttrv_pruning.qwen_hf_pruning import visual_pruning_context
+    except (ImportError, ModuleNotFoundError):
+        pass
+    else:
+        stack.enter_context(visual_pruning_context(module, stage=stage, extra_info=extra_info))
+    try:
+        from src.ttrv_pruning.mmtok_ttrv import mmtok_pruning_context
+    except (ImportError, ModuleNotFoundError):
+        pass
+    else:
+        stack.enter_context(mmtok_pruning_context(module, stage=stage, extra_info=extra_info))
+    try:
+        from src.ttrv_pruning.visionzip_ttrv import visionzip_pruning_context
+    except (ImportError, ModuleNotFoundError):
+        pass
+    else:
+        stack.enter_context(visionzip_pruning_context(module, stage=stage, extra_info=extra_info))
+    return stack
+
+
+def _clear_mmtok_selection_cache(module, *, bump_scope: bool = True):
+    try:
+        from src.ttrv_pruning.mmtok_ttrv import clear_mmtok_selection_cache
+    except (ImportError, ModuleNotFoundError):
+        return
+    clear_mmtok_selection_cache(module, bump_scope=bump_scope)
+
+
+def _last_visual_pruning_forward_info(module):
+    for import_path, func_name in (
+        ("src.ttrv_pruning.qwen_hf_pruning", "last_pruned_forward_info"),
+        ("src.ttrv_pruning.mmtok_ttrv", "last_mmtok_forward_info"),
+    ):
+        try:
+            module_obj = __import__(import_path, fromlist=[func_name])
+        except (ImportError, ModuleNotFoundError):
+            continue
+        info = getattr(module_obj, func_name)(module)
+        if info:
+            return info
+    return None
+
+
+def _sequence_keep_mask_from_last_forward(module, *, expected_length: int, stage: str | None):
+    info = _last_visual_pruning_forward_info(module)
+    if not info or info.get("stage") != stage:
+        return None
+    keep_sequence = info.get("keep_sequence")
+    if keep_sequence is None:
+        return None
+    if not torch.is_tensor(keep_sequence):
+        keep_sequence = torch.as_tensor(keep_sequence, dtype=torch.bool)
+    keep_sequence = keep_sequence.to(device=torch.cuda.current_device(), dtype=torch.bool)
+    if keep_sequence.numel() != expected_length:
+        raise RuntimeError(
+            "visual-pruning log-prob alignment received a sequence mask of "
+            f"length {keep_sequence.numel()} for an input of length {expected_length}"
+        )
+    return keep_sequence
+
+
+def _format_grad_name(name: str | None) -> str:
+    return name if name else "<unnamed_parameter>"
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -53,7 +125,7 @@ class DataParallelPPOActor(BasePPOActor):
         )
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
+        self, micro_batch, temperature, calculate_entropy=False, pruning_stage: str | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -71,11 +143,13 @@ class DataParallelPPOActor(BasePPOActor):
                 for key in micro_batch["multi_modal_inputs"][0].keys():
                     multi_modal_inputs[key] = torch.cat(
                         [inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0
-                    )
+                    ).to(torch.cuda.current_device())
                     if re.match("internvl", self.actor_module.config.model_type):
                         # The image_flags is used for InternVL's github version
                         if key == "pixel_values":
-                            image_flags = torch.ones(multi_modal_inputs[key].size(0), dtype=torch.long)
+                            image_flags = torch.ones(
+                                multi_modal_inputs[key].size(0), dtype=torch.long, device=torch.cuda.current_device()
+                            )
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
@@ -133,14 +207,36 @@ class DataParallelPPOActor(BasePPOActor):
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
-                output = self.actor_module(
-                    input_ids=input_ids_rmpad,
-                    attention_mask=None,
-                    position_ids=position_ids_rmpad,
-                    **multi_modal_inputs,
-                    use_cache=False,
-                )  # prevent model thinks we are generating
+                with _visual_pruning_context(
+                    self.actor_module,
+                    stage=pruning_stage,
+                    extra_info=micro_batch.get("extra_info"),
+                ):
+                    output = self.actor_module(
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        **multi_modal_inputs,
+                        use_cache=False,
+                    )  # prevent model thinks we are generating
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                keep_sequence = _sequence_keep_mask_from_last_forward(
+                    self.actor_module,
+                    expected_length=input_ids_rmpad.size(1),
+                    stage=pruning_stage,
+                )
+                if keep_sequence is not None:
+                    if self.use_ulysses_sp:
+                        raise RuntimeError("visual-pruning log-prob alignment does not support Ulysses SP")
+                    keep_sequence = keep_sequence.to(device=input_ids_rmpad.device)
+                    kept_input_ids = input_ids_rmpad[:, keep_sequence]
+                    input_ids_rmpad_rolled = torch.roll(kept_input_ids, shifts=-1, dims=1).squeeze(0)
+                    if logits_rmpad.size(0) != kept_input_ids.size(1):
+                        raise RuntimeError(
+                            "visual-pruning log-prob alignment expected pruned logits length "
+                            f"{kept_input_ids.size(1)} but got {logits_rmpad.size(0)}"
+                        )
+                    kept_original_indices = torch.nonzero(keep_sequence, as_tuple=False).squeeze(-1)
 
                 logits_rmpad.div_(temperature)
 
@@ -164,6 +260,12 @@ class DataParallelPPOActor(BasePPOActor):
                         entropy_rmpad = gather_outpus_and_unpad(
                             entropy_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
                         )
+                if keep_sequence is not None:
+                    aligned_log_probs = log_probs.new_zeros(input_ids_rmpad.size(1))
+                    log_probs = aligned_log_probs.scatter(0, kept_original_indices, log_probs)
+                    if calculate_entropy:
+                        aligned_entropy = entropy_rmpad.new_zeros(input_ids_rmpad.size(1))
+                        entropy_rmpad = aligned_entropy.scatter(0, kept_original_indices, entropy_rmpad)
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
                     full_entropy = pad_input(
@@ -179,13 +281,18 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
-                output = self.actor_module(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    **multi_modal_inputs,
-                    use_cache=False,
-                )  # prevent model thinks we are generating
+                with _visual_pruning_context(
+                    self.actor_module,
+                    stage=pruning_stage,
+                    extra_info=micro_batch.get("extra_info"),
+                ):
+                    output = self.actor_module(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        **multi_modal_inputs,
+                        use_cache=False,
+                    )  # prevent model thinks we are generating
                 logits = output.logits
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
@@ -195,20 +302,81 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
 
+    def _grad_diagnostics(self):
+        total_params = 0
+        grad_params = 0
+        nonfinite = []
+        first_grad = None
+        for name, param in self.actor_module.named_parameters():
+            total_params += 1
+            grad = param.grad
+            if grad is None:
+                continue
+            grad_params += 1
+            if first_grad is None:
+                first_grad = (name, tuple(grad.shape), str(grad.dtype), str(grad.device))
+            try:
+                if not torch.isfinite(grad).all().item():
+                    nonfinite.append((name, tuple(grad.shape), str(grad.dtype), str(grad.device)))
+            except RuntimeError as exc:
+                print(f"ERROR: gradient diagnostics failed reading {_format_grad_name(name)}: {exc}")
+                raise
+
+        print(
+            "actor grad diagnostics: "
+            f"total_params={total_params}, grad_params={grad_params}, "
+            f"first_grad={first_grad}, nonfinite_count={len(nonfinite)}"
+        )
+        for name, shape, dtype, device in nonfinite[:10]:
+            print(f"actor grad diagnostics nonfinite: {name} shape={shape} dtype={dtype} device={device}")
+
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
+        fsdp_config = self.config.get("fsdp_config", {})
+        defer_optimizer_load = fsdp_config.get("optimizer_offload", False) and fsdp_config.get(
+            "defer_optimizer_load", False
+        )
 
+        def optimizer_step():
+            if defer_optimizer_load:
+                load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+            self.actor_optimizer.step()
+            if defer_optimizer_load:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+                torch.cuda.empty_cache()
+
+        if self.config.get("grad_diagnostics", False):
+            self._grad_diagnostics()
+
+        if self.config.get("skip_grad_clip", False):
+            grad_norm = torch.tensor(float("nan"), device=torch.cuda.current_device())
+            optimizer_step()
+            return grad_norm
+
+        foreach = self.config.get("grad_clip_foreach", False)
         if isinstance(self.actor_module, FSDP):
-            grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            if world_size == 1:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.actor_module.parameters(),
+                    max_norm=self.config.grad_clip,
+                    foreach=foreach,
+                )
+            else:
+                grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor_module.parameters(),
+                max_norm=self.config.grad_clip,
+                foreach=foreach,
+            )
 
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
             print(f"WARN: grad_norm is not finite: {grad_norm}")
-            self.actor_optimizer.zero_grad()
+            self.actor_optimizer.zero_grad(set_to_none=True)
         else:
-            self.actor_optimizer.step()
+            optimizer_step()
         return grad_norm
 
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
@@ -234,6 +402,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
+        if temperature <= 0:
+            raise ValueError("actor_rollout_ref.rollout.temperature must be > 0 for log-prob computation")
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
@@ -243,6 +413,8 @@ class DataParallelPPOActor(BasePPOActor):
         if has_multi_modal_inputs:
             num_micro_batches = data.batch.batch_size[0] // micro_batch_size
             non_tensor_select_keys = ["multi_modal_inputs"]
+            if "extra_info" in data.non_tensor_batch:
+                non_tensor_select_keys.append("extra_info")
             micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
         elif use_dynamic_bsz:
             # split using dynamic bsz
@@ -260,7 +432,10 @@ class DataParallelPPOActor(BasePPOActor):
             response_mask = micro_batch["attention_mask"][:, -micro_batch["responses"].size(-1) :]
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
-                    micro_batch, temperature=temperature, calculate_entropy=calculate_entropy
+                    micro_batch,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    pruning_stage="old_log_prob",
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
@@ -283,128 +458,140 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
+        if temperature <= 0:
+            raise ValueError("actor_rollout_ref.rollout.temperature must be > 0 for actor log-prob training")
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        non_tensor_select_keys = ["multi_modal_inputs"]
+        if "extra_info" in data.non_tensor_batch:
+            non_tensor_select_keys.append("extra_info")
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         if has_multi_modal_inputs:
             num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
-            non_tensor_select_keys = ["multi_modal_inputs"]
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
-        for epoch in range(self.config.ppo_epochs):
-            for batch_idx, data in enumerate(dataloader):
-                # split batch into micro_batches
-                mini_batch = data
-                if has_multi_modal_inputs:
-                    self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    )
-                    num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
-                    micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
-                elif self.config.use_dynamic_bsz:
-                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
-                else:
-                    self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    )
+        try:
+            for epoch in range(self.config.ppo_epochs):
+                for batch_idx, data in enumerate(dataloader):
                     # split batch into micro_batches
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
-
-                self.actor_optimizer.zero_grad()
-
-                for data in micro_batches:
-                    # Support all hardwares
-                    if isinstance(data, DataProto):
-                        data = {**data.batch.to(torch.cuda.current_device()), **data.non_tensor_batch}
-                    else:
-                        data = data.to(torch.cuda.current_device())  # actor device is cpu when using offload
-                    responses = data["responses"]
-                    response_length = responses.size(1)
-                    attention_mask = data["attention_mask"]
-                    response_mask = attention_mask[:, -response_length:]
-                    old_log_prob = data["old_log_probs"]
-                    advantages = data["advantages"]
-
-                    clip_ratio = self.config.clip_ratio
-                    clip_ratio_low = (
-                        self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
-                    )
-                    clip_ratio_high = (
-                        self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
-                    )
-                    clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
-                    entropy_coeff = self.config.entropy_coeff
-                    loss_agg_mode = self.config.loss_agg_mode
-
-                    # all return: (bsz, response_length)
-                    calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy
-                    )
-
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
-                    )
-
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
-                    else:
-                        policy_loss = pg_loss
-
-                    if self.config.use_kl_loss:
-                        ref_log_prob = data["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                    mini_batch = data
+                    if has_multi_modal_inputs:
+                        self.gradient_accumulation = (
+                            self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                         )
-                        kl_loss = agg_loss(
-                            loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode
+                        num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+                        micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+                    elif self.config.use_dynamic_bsz:
+                        max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                        micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    else:
+                        self.gradient_accumulation = (
+                            self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                        )
+                        # split batch into micro_batches
+                        micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                    self.actor_optimizer.zero_grad(set_to_none=True)
+
+                    for data in micro_batches:
+                        # Support all hardwares
+                        if isinstance(data, DataProto):
+                            data = {**data.batch.to(torch.cuda.current_device()), **data.non_tensor_batch}
+                        else:
+                            data = data.to(torch.cuda.current_device())  # actor device is cpu when using offload
+                        responses = data["responses"]
+                        response_length = responses.size(1)
+                        attention_mask = data["attention_mask"]
+                        response_mask = attention_mask[:, -response_length:]
+                        old_log_prob = data["old_log_probs"]
+                        advantages = data["advantages"]
+
+                        clip_ratio = self.config.clip_ratio
+                        clip_ratio_low = (
+                            self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+                        )
+                        clip_ratio_high = (
+                            self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+                        )
+                        clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
+                        entropy_coeff = self.config.entropy_coeff
+                        loss_agg_mode = self.config.loss_agg_mode
+
+                        # all return: (bsz, response_length)
+                        calculate_entropy = False
+                        if entropy_coeff != 0:
+                            calculate_entropy = True
+                        entropy, log_prob = self._forward_micro_batch(
+                            micro_batch=data,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            pruning_stage="actor_update",
                         )
 
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        metrics["actor/kl_loss"] = kl_loss.detach().item()
-                        metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                        )
 
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
-                    else:
-                        loss = policy_loss / self.gradient_accumulation
-                    loss.backward()
+                        if entropy_coeff != 0:
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-                    data = {
-                        "actor/pg_loss": pg_loss.detach().item(),
-                        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-                        "actor/ppo_kl": ppo_kl.detach().item(),
-                        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                    }
-                    append_to_dict(metrics, data)
+                            # compute policy loss
+                            policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        else:
+                            policy_loss = pg_loss
 
-                grad_norm = self._optimizer_step()
-                data = {"actor/grad_norm": grad_norm.detach().item()}
-            append_to_dict(metrics, data)
-        self.actor_optimizer.zero_grad()
-        return metrics
+                        if self.config.use_kl_loss:
+                            ref_log_prob = data["ref_log_prob"]
+                            # compute kl loss
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
+                            kl_loss = agg_loss(
+                                loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode
+                            )
+
+                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                            metrics["actor/kl_loss"] = kl_loss.detach().item()
+                            metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                        if self.config.use_dynamic_bsz:
+                            # relative to the dynamic bsz
+                            loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                        else:
+                            loss = policy_loss / self.gradient_accumulation
+                        loss.backward()
+
+                        data = {
+                            "actor/pg_loss": pg_loss.detach().item(),
+                            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                            "actor/ppo_kl": ppo_kl.detach().item(),
+                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                        }
+                        append_to_dict(metrics, data)
+
+                    grad_norm = self._optimizer_step()
+                    data = {"actor/grad_norm": grad_norm.detach().item()}
+                    self.actor_optimizer.zero_grad(set_to_none=True)
+                append_to_dict(metrics, data)
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            return metrics
+        finally:
+            _clear_mmtok_selection_cache(self.actor_module, bump_scope=True)

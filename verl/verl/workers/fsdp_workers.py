@@ -210,7 +210,12 @@ class ActorRolloutRefWorker(Worker):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+            visionzip_pruning_config = self.config.model.get("visionzip_pruning", None)
+            if role == "actor" and visionzip_pruning_config is not None and visionzip_pruning_config.get("enabled", False):
+                from src.ttrv_pruning.visionzip_ttrv import visionzip_model_class
+
+                actor_module_class = visionzip_model_class()
+            elif type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
                 actor_module_class = AutoModelForVision2Seq
             elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
                 actor_module_class = AutoModelForImageTextToText
@@ -259,6 +264,21 @@ class ActorRolloutRefWorker(Worker):
 
                 _apply_liger_kernel_to_instance(model=actor_module)
 
+            visual_pruning_config = self.config.model.get("visual_pruning", None)
+            if role == "actor" and visual_pruning_config is not None and visual_pruning_config.get("enabled", False):
+                from src.ttrv_pruning.qwen_hf_pruning import configure_qwen_visual_pruning
+
+                configure_qwen_visual_pruning(actor_module, visual_pruning_config)
+            mmtok_pruning_config = self.config.model.get("mmtok_pruning", None)
+            if role == "actor" and mmtok_pruning_config is not None and mmtok_pruning_config.get("enabled", False):
+                from src.ttrv_pruning.mmtok_ttrv import configure_qwen_mmtok_pruning
+
+                configure_qwen_mmtok_pruning(actor_module, mmtok_pruning_config, tokenizer=self.tokenizer)
+            if role == "actor" and visionzip_pruning_config is not None and visionzip_pruning_config.get("enabled", False):
+                from src.ttrv_pruning.visionzip_ttrv import configure_qwen_visionzip_pruning
+
+                configure_qwen_visionzip_pruning(actor_module, visionzip_pruning_config)
+
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
 
@@ -286,7 +306,8 @@ class ActorRolloutRefWorker(Worker):
 
         auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get("wrap_policy", None))
 
-        if self._is_rollout and self.config.rollout.name == "hf":
+        allow_hf_rollout_auto_wrap = fsdp_config.get("allow_hf_rollout_auto_wrap", False)
+        if self._is_rollout and self.config.rollout.name == "hf" and not allow_hf_rollout_auto_wrap:
             # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
             auto_wrap_policy = None
 
@@ -303,7 +324,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module,
             cpu_offload=cpu_offload,
             param_init_fn=init_fn,
-            use_orig_params=False,
+            use_orig_params=use_orig_params,
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),
             sharding_strategy=sharding_strategy,  # zero3
@@ -319,12 +340,36 @@ class ActorRolloutRefWorker(Worker):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-            actor_optimizer = optim.AdamW(
-                actor_module_fsdp.parameters(),
-                lr=optim_config.lr,
-                betas=optim_config.get("betas", (0.9, 0.999)),
-                weight_decay=optim_config.get("weight_decay", 1e-2),
-            )
+            optimizer_name = str(optim_config.get("name", "adamw")).lower()
+            if optimizer_name == "adamw":
+                actor_optimizer = optim.AdamW(
+                    actor_module_fsdp.parameters(),
+                    lr=optim_config.lr,
+                    betas=optim_config.get("betas", (0.9, 0.999)),
+                    weight_decay=optim_config.get("weight_decay", 1e-2),
+                    foreach=optim_config.get("foreach", False),
+                )
+            elif optimizer_name in {"adamw_lowmem", "low_memory_adamw"}:
+                from verl.utils.low_memory_optim import LowMemoryAdamW
+
+                actor_optimizer = LowMemoryAdamW(
+                    actor_module_fsdp.parameters(),
+                    lr=optim_config.lr,
+                    betas=optim_config.get("betas", (0.9, 0.999)),
+                    weight_decay=optim_config.get("weight_decay", 1e-2),
+                    eps=optim_config.get("eps", 1e-8),
+                    chunk_size=optim_config.get("chunk_size", 16_777_216),
+                )
+            elif optimizer_name == "sgd":
+                actor_optimizer = optim.SGD(
+                    actor_module_fsdp.parameters(),
+                    lr=optim_config.lr,
+                    momentum=optim_config.get("momentum", 0.0),
+                    weight_decay=optim_config.get("weight_decay", 0.0),
+                    foreach=optim_config.get("foreach", False),
+                )
+            else:
+                raise NotImplementedError(f"Actor optimizer {optimizer_name!r} is not supported")
 
             total_steps = optim_config.get("total_training_steps", 0)
             num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
@@ -528,9 +573,10 @@ class ActorRolloutRefWorker(Worker):
         data = data.to(torch.cuda.current_device())
 
         assert self._is_actor
+        defer_optimizer_load = self.config.actor.fsdp_config.get("defer_optimizer_load", False)
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
+        if self._is_offload_optimizer and not defer_optimizer_load:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
 
         log_gpu_memory_usage("Before update policy", logger=logger)
@@ -870,6 +916,7 @@ class CriticWorker(Worker):
             lr=config.optim.lr,
             betas=config.optim.get("betas", (0.9, 0.999)),
             weight_decay=config.optim.get("weight_decay", 1e-2),
+            foreach=config.optim.get("foreach", False),
         )
 
         total_steps = config.optim.get("total_training_steps", 0)

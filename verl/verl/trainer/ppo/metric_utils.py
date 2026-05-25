@@ -111,6 +111,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
         .detach()
         .item(),
+        # In this PPO path the response mask is the loss mask, so these are
+        # the response tokens that actually contribute to old-log-prob/update losses.
+        "loss_bearing_response_tokens/mean": torch.mean(response_length).detach().item(),
+        "loss_bearing_response_tokens/max": torch.max(response_length).detach().item(),
+        "loss_bearing_response_tokens/min": torch.min(response_length).detach().item(),
+        "loss_bearing_response_tokens/total": torch.sum(response_length).detach().item(),
         # prompt length
         "prompt_length/mean": torch.mean(prompt_length).detach().item(),
         "prompt_length/max": torch.max(prompt_length).detach().item(),

@@ -20,8 +20,6 @@ import os
 import hydra
 import ray
 
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-
 
 def get_custom_reward_fn(config):
     import importlib.util
@@ -68,11 +66,28 @@ def run_ppo(config) -> None:
     # isolation, will solve in the future
     os.environ["ENSURE_CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if not ray.is_initialized():
+        worker_env_vars = {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
+        worker_pythonpath = os.environ.get("TTRV_WORKER_PYTHONPATH")
+        if worker_pythonpath:
+            worker_env_vars["PYTHONPATH"] = worker_pythonpath
         # this is for local ray cluster
-        ray.init(
-            runtime_env={
-                "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
+        init_kwargs = {
+            "include_dashboard": False,
+            "runtime_env": {"env_vars": worker_env_vars},
+        }
+        ray_num_cpus = os.environ.get("TTRV_RAY_NUM_CPUS")
+        if ray_num_cpus:
+            init_kwargs["num_cpus"] = int(ray_num_cpus)
+        if not os.environ.get("RAY_ADDRESS"):
+            init_kwargs["_system_config"] = {
+                "agent_register_timeout_ms": 120000,
+                "raylet_start_wait_time_s": 120,
+                "enable_metrics_collection": False,
+                "enable_open_telemetry": False,
+                "enable_ray_event": False,
             }
+        ray.init(
+            **init_kwargs,
         )
 
     runner = TaskRunner.remote()
@@ -91,6 +106,7 @@ class TaskRunner:
 
         from omegaconf import OmegaConf
 
+        from verl.trainer.ppo.ray_trainer import RayPPOTrainer
         from verl.utils.fs import copy_to_local
 
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values

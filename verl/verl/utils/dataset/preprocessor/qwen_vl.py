@@ -17,9 +17,10 @@
 The QwenVL2 preprocessor used for the multi-modal models.
 """
 
-from io import BytesIO
-from typing import Optional, Union
 import os
+from inspect import signature
+from io import BytesIO
+
 import torch
 from PIL import Image
 from qwen_vl_utils import fetch_image, fetch_video
@@ -36,6 +37,38 @@ MAX_RATIO = 200
 
 VIDEO_MIN_PIXELS = 128 * 28 * 28
 VIDEO_TOTAL_PIXELS = int(float(os.environ.get('VIDEO_MAX_PIXELS', 128000 * 28 * 28 * 0.9)))
+
+_FETCH_IMAGE_PARAMS = set(signature(fetch_image).parameters)
+_FETCH_VIDEO_PARAMS = set(signature(fetch_video).parameters)
+
+
+def _image_patch_size_from_factor(fetch_fn, factor):
+    merge_size = fetch_fn.__globals__.get("SPATIAL_MERGE_SIZE", 2)
+    return max(1, round(factor / merge_size))
+
+
+def _fetch_image_compat(image, factor):
+    if "size_factor" in _FETCH_IMAGE_PARAMS:
+        return fetch_image(image, size_factor=factor)
+    if "image_patch_size" in _FETCH_IMAGE_PARAMS:
+        return fetch_image(image, image_patch_size=_image_patch_size_from_factor(fetch_image, factor))
+    return fetch_image(image)
+
+
+def _fetch_video_compat(video, image_factor, return_video_sample_fps):
+    if "image_factor" in _FETCH_VIDEO_PARAMS:
+        return fetch_video(
+            video,
+            image_factor=image_factor,
+            return_video_sample_fps=return_video_sample_fps,
+        )
+    if "image_patch_size" in _FETCH_VIDEO_PARAMS:
+        return fetch_video(
+            video,
+            image_patch_size=_image_patch_size_from_factor(fetch_video, image_factor),
+            return_video_sample_fps=return_video_sample_fps,
+        )
+    return fetch_video(video, return_video_sample_fps=return_video_sample_fps)
 
 VIDEO_FORMAT_HELP = """Currently, we only support the video formats introduced in qwen2-vl.
 Refer to https://github.com/QwenLM/Qwen2.5-VL?tab=readme-ov-file#using---transformers-to-chat.
@@ -76,15 +109,16 @@ class QwenVLPreProcessor(BasicPreprocessor):
     def process_image(self, image, **kwargs) -> torch.Tensor:
         if isinstance(image, Image.Image):
             return image.convert("RGB")
-        max_pixels = kwargs.get("max_pixels", self.max_pixels)
-        min_pixels = kwargs.get("min_pixels", self.min_pixels)
-        factor = kwargs.get("size_factor", self.factor)
+        image = dict(image)
+        max_pixels = image.get("max_pixels", kwargs.get("max_pixels", self.max_pixels))
+        min_pixels = image.get("min_pixels", kwargs.get("min_pixels", self.min_pixels))
+        factor = image.get("size_factor", kwargs.get("size_factor", self.factor))
         if "bytes" in image:
             assert "image" not in image, "Cannot have both `bytes` and `image`"
             image["image"] = BytesIO(image["bytes"])
         image["max_pixels"] = max_pixels
         image["min_pixels"] = min_pixels
-        image = fetch_image(image, size_factor=factor)
+        image = _fetch_image_compat(image, factor)
         return image
     def process_audio(self, audio, **kwargs):
         raise ValueError("QwenVL series does not support audio input")
@@ -121,4 +155,4 @@ class QwenVLPreProcessor(BasicPreprocessor):
         video["min_pixels"] = video_min_pixels
         return_video_sample_fps = kwargs.get("return_video_sample_fps", False)
         image_factor = kwargs.get("image_factor", self.factor)
-        return fetch_video(video, image_factor=image_factor, return_video_sample_fps=return_video_sample_fps)
+        return _fetch_video_compat(video, image_factor=image_factor, return_video_sample_fps=return_video_sample_fps)

@@ -87,13 +87,45 @@ def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> Ten
     return tensor_dict1
 
 
+def _non_tensor_equal(left, right) -> bool:
+    """Compare non-tensor batch values, including object arrays with tensors."""
+    if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+        if left.shape != right.shape or left.dtype != right.dtype:
+            return False
+        return torch.equal(left.detach().cpu(), right.detach().cpu())
+
+    if isinstance(left, np.ndarray) and isinstance(right, np.ndarray):
+        if left.shape != right.shape:
+            return False
+        if left.dtype != object and right.dtype != object:
+            return bool(np.array_equal(left, right, equal_nan=True))
+        return all(_non_tensor_equal(l_item, r_item) for l_item, r_item in zip(left.flat, right.flat))
+
+    if isinstance(left, dict) and isinstance(right, dict):
+        if left.keys() != right.keys():
+            return False
+        return all(_non_tensor_equal(left[key], right[key]) for key in left)
+
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        if len(left) != len(right):
+            return False
+        return all(_non_tensor_equal(l_item, r_item) for l_item, r_item in zip(left, right))
+
+    if pd.isna(left) and pd.isna(right):
+        return True
+
+    try:
+        return bool(left == right)
+    except RuntimeError:
+        return False
+
+
 def union_numpy_dict(tensor_dict1: dict[str, np.ndarray], tensor_dict2: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     for key, val in tensor_dict2.items():
         if key in tensor_dict1:
             assert isinstance(tensor_dict2[key], np.ndarray)
             assert isinstance(tensor_dict1[key], np.ndarray)
-            # to properly deal with nan and object type
-            assert pd.DataFrame(tensor_dict2[key]).equals(pd.DataFrame(tensor_dict1[key])), (
+            assert _non_tensor_equal(tensor_dict2[key], tensor_dict1[key]), (
                 f"{key} in tensor_dict1 and tensor_dict2 are not the same object"
             )
         tensor_dict1[key] = val
