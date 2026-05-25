@@ -46,6 +46,8 @@ class TTRLRewardManager:
             return "gpqa"
         elif data_source in ["bbox"]:
             return "bbox"
+        elif data_source in ["MME-TTT"]:
+            return "mme"
         else:
             raise NotImplementedError(f"Data source {data_source} is not supported for TTRLRewardManager")
 
